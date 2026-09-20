@@ -8849,9 +8849,8 @@ async def ask_llm(user_id, user_name, message_text, attachments_data=None, chann
                         )
                     else:
                         campaign_state["last_roll"] = attack_result
-                        raw_reply = (
-                            "El ataque fue resuelto mecánicamente. "
-                            f"Resultado: {attack_result}"
+                        raw_reply = build_attack_narration(
+                            attack_result
                         )
 
                 except Exception as exc:
@@ -9394,6 +9393,326 @@ async def on_ready():
         print(f"[ERROR on_ready]: {exc}")
 
 
+
+def normalize_combat_command_text(value):
+    """Normaliza texto para reconocer órdenes mecánicas de combate."""
+    if not isinstance(value, str):
+        return ""
+
+    value = value.strip().casefold()
+
+    replacements = {
+        "á": "a",
+        "é": "e",
+        "í": "i",
+        "ó": "o",
+        "ú": "u",
+        "ü": "u",
+    }
+
+    for source, target in replacements.items():
+        value = value.replace(source, target)
+
+    return re.sub(r"\s+", " ", value)
+
+
+def resolve_monster_idx_from_command(text):
+    """
+    Convierte un nombre visible de monstruo a un idx real de Magical20.
+
+    No inventa monstruos: cada candidato se valida mediante
+    get_monster_combat_data().
+    """
+    normalized = normalize_combat_command_text(text)
+
+    if not normalized:
+        return None
+
+    aliases = {
+        "goblin": "goblin",
+        "goblins": "goblin",
+        "trasgo": "goblin",
+        "trasgos": "goblin",
+    }
+
+    candidates = []
+
+    for alias, monster_idx in aliases.items():
+        if re.search(rf"\b{re.escape(alias)}\b", normalized):
+            candidates.append(monster_idx)
+
+    # También permitir que el texto sea directamente un idx.
+    if normalized in aliases.values():
+        candidates.append(normalized)
+
+    seen = set()
+
+    for monster_idx in candidates:
+        if monster_idx in seen:
+            continue
+
+        seen.add(monster_idx)
+
+        monster_data = get_monster_combat_data(monster_idx)
+
+        if isinstance(monster_data, dict):
+            return monster_idx
+
+    return None
+
+
+def find_combat_monster_by_idx(monster_idx):
+    """Devuelve la instancia existente de un monstruo, si hay exactamente una."""
+    combat = campaign_state.get("combat")
+
+    if not isinstance(combat, dict):
+        return None
+
+    combatants = combat.get("combatants")
+
+    if not isinstance(combatants, list):
+        return None
+
+    matches = [
+        combatant
+        for combatant in combatants
+        if (
+            isinstance(combatant, dict)
+            and combatant.get("type") == "monster"
+            and combatant.get("monster_idx") == monster_idx
+        )
+    ]
+
+    if len(matches) == 1:
+        return matches[0]
+
+    return None
+
+
+async def handle_direct_combat_command(user_id, text, channel):
+    """
+    Ejecuta órdenes explícitas de combate sin pasar por el LLM.
+
+    Devuelve:
+        str  -> la orden fue reconocida y procesada.
+        None -> no era una orden directa de combate.
+    """
+    normalized = normalize_combat_command_text(text)
+
+    if not normalized:
+        return None
+
+    start_match = re.search(
+        r"\b(?:iniciar|inicia|iniciemos|empezar|empieza|comenzar|comienza)"
+        r"\s+(?:un\s+)?combate\b",
+        normalized,
+    )
+
+    add_match = re.search(
+        r"\b(?:agrega|agregar|anade|anadir|añade|añadir|mete|meter)"
+        r"\s+(?:un\s+)?(.+?)"
+        r"\s+al\s+combate\b",
+        normalized,
+    )
+
+    if not start_match and not add_match:
+        return None
+
+    monster_idx = resolve_monster_idx_from_command(normalized)
+
+    if monster_idx is None:
+        return (
+            "⚠️ No pude identificar un monstruo válido en la orden de combate."
+        )
+
+    combat = campaign_state.get("combat")
+
+    if not isinstance(combat, dict):
+        return "⚠️ El estado de combate no está disponible."
+
+    # --------------------------------------------------------
+    # AGREGAR MONSTRUO
+    # --------------------------------------------------------
+    if add_match and not start_match:
+        if combat.get("active") is True:
+            return (
+                "⚠️ El combate ya está activo. No se puede agregar "
+                "un monstruo sin recalcular la iniciativa."
+            )
+
+        combatant = add_monster_to_combat(monster_idx)
+
+        if not isinstance(combatant, dict):
+            return (
+                f"⚠️ No pude agregar el monstruo «{monster_idx}» "
+                "al combate."
+            )
+
+        monster_data = get_monster_combat_data(monster_idx)
+        monster_name = (
+            monster_data.get("name", monster_idx)
+            if isinstance(monster_data, dict)
+            else monster_idx
+        )
+
+        persist()
+
+        return (
+            f"⚔️ **{monster_name} agregado al combate.**\n"
+            "El combate todavía no comenzó. "
+            "Podés iniciar el combate cuando estén preparados."
+        )
+
+    # --------------------------------------------------------
+    # INICIAR COMBATE
+    # --------------------------------------------------------
+    character_name = campaign_state.get(
+        "player_bindings", {}
+    ).get(str(user_id))
+
+    if not character_name:
+        return (
+            "⚠️ No hay un personaje asociado a este jugador. "
+            "No puedo iniciar el combate."
+        )
+
+    if combat.get("active") is True:
+        return "⚠️ Ya hay un combate activo."
+
+    character = get_character_by_name(character_name)
+
+    if character is None:
+        return (
+            f"⚠️ No encontré la ficha de {character_name}."
+        )
+
+    # Agregar el personaje si todavía no forma parte del combate.
+    character_combatant_id = f"character:{character_name}"
+
+    character_present = any(
+        isinstance(combatant, dict)
+        and combatant.get("id") == character_combatant_id
+        for combatant in combat.get("combatants", [])
+    )
+
+    if not character_present:
+        if add_character_to_combat(character_name) is None:
+            return (
+                f"⚠️ No pude agregar a {character_name} "
+                "al combate."
+            )
+
+    # Agregar el monstruo si todavía no existe.
+    existing_monster = find_combat_monster_by_idx(monster_idx)
+
+    if existing_monster is None:
+        if add_monster_to_combat(monster_idx) is None:
+            return (
+                f"⚠️ No pude agregar el monstruo «{monster_idx}» "
+                "al combate."
+            )
+
+    # La iniciativa se resuelve exclusivamente mediante Dice Golem.
+    result = await start_combat(channel)
+
+    if not isinstance(result, dict):
+        return (
+            "⚠️ No se pudo iniciar el combate porque "
+            "la iniciativa no pudo resolverse con Dice Golem. "
+            "No se inventó ningún resultado."
+        )
+
+    persist()
+
+    monster_data = get_monster_combat_data(monster_idx)
+
+    monster_name = (
+        monster_data.get("name", monster_idx)
+        if isinstance(monster_data, dict)
+        else monster_idx
+    )
+
+    turn = result.get("turn")
+    round_number = result.get("round")
+
+    if turn == character_combatant_id:
+        turn_text = f"Es el turno de **{character_name}**."
+    else:
+        turn_text = "Es el turno del monstruo."
+
+    return (
+        f"⚔️ **Combate iniciado contra {monster_name}.**\n"
+        f"Ronda: **{round_number}**.\n"
+        f"{turn_text}"
+    )
+
+
+def build_attack_narration(attack_result):
+    """
+    Genera una narración final usando exclusivamente datos mecánicos reales.
+
+    No tira dados, no modifica estado y no permite que el LLM invente
+    el resultado del ataque.
+    """
+    if not isinstance(attack_result, dict):
+        return "⚠️ El ataque fue resuelto, pero no hay resultado narrable."
+
+    character = attack_result.get("character", "El personaje")
+    weapon = attack_result.get("weapon", "arma")
+    monster_idx = attack_result.get("monster", "monstruo")
+
+    attack = attack_result.get("attack")
+    damage = attack_result.get("damage")
+    applied = attack_result.get("applied")
+
+    if not isinstance(attack, dict):
+        return "⚠️ El ataque no contiene un resultado mecánico válido."
+
+    outcome = str(attack.get("outcome", "")).casefold()
+
+    if outcome == "miss":
+        return (
+            f"⚔️ **{character}** ataca al **{monster_idx}** "
+            f"con **{weapon}**, pero el ataque falla."
+        )
+
+    if not isinstance(damage, dict):
+        return (
+            f"⚔️ **{character}** impacta al **{monster_idx}** "
+            f"con **{weapon}**."
+        )
+
+    damage_value = damage.get("damage", 0)
+
+    try:
+        damage_value = int(damage_value)
+    except (TypeError, ValueError):
+        damage_value = 0
+
+    critical = outcome == "critical"
+
+    if critical:
+        opening = (
+            f"💥 **Golpe crítico. {character}** impacta al "
+            f"**{monster_idx}** con **{weapon}**."
+        )
+    else:
+        opening = (
+            f"⚔️ **{character}** impacta al **{monster_idx}** "
+            f"con **{weapon}**."
+        )
+
+    if isinstance(applied, dict) and applied.get("dead") is True:
+        return (
+            f"{opening} Causa **{damage_value}** de daño. "
+            f"El **{monster_idx}** cae derrotado."
+        )
+
+    return (
+        f"{opening} Causa **{damage_value}** de daño."
+    )
+
+
 @bot.event
 async def on_message(message):
     # Ignorar mensajes propios.
@@ -9433,13 +9752,23 @@ async def on_message(message):
                 print(f"[ERROR Imagen adjunta]: {exc}")
 
     try:
-        reply = await ask_llm(
-            user_id=str(message.author.id),
-            user_name=message.author.display_name,
-            message_text=texto,
-            attachments_data=attachments_data or None,
-            channel=message.channel,
+        # Las órdenes explícitas de combate tienen prioridad sobre el LLM.
+        # Así el Master no puede convertir una acción mecánica en narrativa
+        # sin modificar realmente el estado de combate.
+        reply = await handle_direct_combat_command(
+            str(message.author.id),
+            texto,
+            message.channel,
         )
+
+        if reply is None:
+            reply = await ask_llm(
+                user_id=str(message.author.id),
+                user_name=message.author.display_name,
+                message_text=texto,
+                attachments_data=attachments_data or None,
+                channel=message.channel,
+            )
 
         if reply:
             reply = await process_reply(message, reply)
